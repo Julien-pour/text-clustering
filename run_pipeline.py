@@ -8,20 +8,39 @@ from datasets import Dataset, load_dataset
 
 from src.plot_utils import plot_distributions
 from src.text_clustering import ClusterClassifier
+import json
 
-INSTRUCTION_SINGLE_TOPIC = "The examples below are web samples from the same cluster, identify the topic they have in common, for example: Philosophy, Lifesyle, Linear Algebra, Biochemistry, Economics...\
+# INSTRUCTION_SINGLE_TOPIC = "The examples below are web samples from the same cluster, identify the topic they have in common, for example: Philosophy, Lifesyle, Linear Algebra, Biochemistry, Economics...\
+# Additionally determine if the topics in the examples \
+# are broadly suitable as college/school material, while being mindful to exclude any sensitive/inappropriate/irrelevant content, \
+# including but not limited to sex, explicit violence, ads & scams, and other non-academic subjects. Consider a wide range of content including scientific, \
+# educational, historical, cultural, and practical applications and give a rating of how educational these topics could be from 1 to 10, 1 being extremely un-educational \
+# and inapproriate for an education setting and 10 being highly educational. The output format should be like this: Topic: the_topic, Educational value rating: score."
+INSTRUCTION_SINGLE_TOPIC = "The examples below are Python Programming Puzzles from the same cluster, identify the topic they have in common, for example: String Manipulation, Mathematical Operations, Conditional Logic, ...\n\
 Additionally determine if the topics in the examples \
-are broadly suitable as college/school material, while being mindful to exclude any sensitive/inappropriate/irrelevant content, \
-including but not limited to sex, explicit violence, ads & scams, and other non-academic subjects. Consider a wide range of content including scientific, \
-educational, historical, cultural, and practical applications and give a rating of how educational these topics could be from 1 to 10, 1 being extremely un-educational \
-and inapproriate for an education setting and 10 being highly educational. The output format should be like this: Topic: the_topic, Educational value rating: score."
+are broadly suitable as bachelor CS material.\n\
+Consider a specific range of leetcode type puzzle, \
+give a rating of how educational these puzzles could be from 1 to 10, 1 being extremely un-educational \
+and inapproriate for an education setting and 10 being highly educational.\nThe output format should be like this: Topic: the_topic, Educational value rating: score."
+
 INSTRUCTION_MULTIPLE_TOPICS = "Use three words total (comma separated)\
-to describe general topics in above texts. Under no circumstances use enumeration. \
-Example format: Tree, Cat, Fireman"
+to describe general topics in above Python Programming Puzzles. Under no circumstances use enumeration. \
+Example format:\n\
+Topic: String Manipulation, Mathematical Operations, Conditional Logic"
 
 
 TEMPLATE_MULTIPLE_TOPICS = "<s>[INST]{examples}\n\n{instruction}[/INST]"
+TEMPLATE_MULTIPLE_TOPIC_chatml = """<|im_start|>system
+You are a sentient, superintelligent artificial general intelligence, here to teach and assist me.<|im_end|>
+<|im_start|>user
+{instruction}\n\nExamples:\n{examples}\n\nRemember that the output format **must** be like this: Topic: topic_1, topic_2, topic_3.<|im_end|>
+<|im_start|>assistant"""
 TEMPLATE_SINGLE_TOPIC = "<s>[INST]{instruction}\n\nExamples:\n{examples}\nRemember that the output format should be like this: Topic: the_topic, Educational value rating: score.[/INST]"
+TEMPLATE_SINGLE_TOPIC_chatml = """<|im_start|>system
+You are a sentient, superintelligent artificial general intelligence, here to teach and assist me.<|im_end|>
+<|im_start|>user
+{instruction}\n\nExamples:\n{examples}\n\nRemember that the output format **must** be like this: Topic: the_topic, Educational value rating: score.<|im_end|>
+<|im_start|>assistant"""
 
 
 def get_args():
@@ -30,11 +49,11 @@ def get_args():
     parser.add_argument("--start", type=int, default=-1)
     parser.add_argument("--end", type=int, default=100_000)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_load_path", type=str, default="./cc_100k")
+    parser.add_argument("--save_load_path", type=str, default="./aces_test")
     parser.add_argument(
         "--input_dataset",
         type=str,
-        default="HuggingFaceFW/FW-12-12-2023-CC-2023-06",
+        default="/home/flowers/work/text-clustering/archive/maps_1_imgep_smart.json",
         help="dataset with the samples to use for clustering",
     )
     parser.add_argument(
@@ -43,24 +62,24 @@ def get_args():
         default=None,
         help="dataset subset",
     )
-    parser.add_argument("--input_content", type=str, default="content")
+    parser.add_argument("--input_content", type=str, default="program_str")
     parser.add_argument(
         "--topic_mode",
         type=str,
         choices=["single_topic", "multiple_topics"],
-        default="multiple_topics",
+        default="single_topic",
         help="Specify 'single_topic' to generate only one topic and score its educational value, or 'multiple_topics' to generate the 3 most relevant topics in the cluster.",
     )
     parser.add_argument(
         "--dbscan_eps",
         type=float,
-        default=0.08,
+        default=0.1,#0.08,
         help="The maximum distance between two samples for them to be considered as in the neighborhood of each other.",
     )
     parser.add_argument(
         "--dbscan_min_samples",
         type=int,
-        default=50,
+        default=4,
         help="The number of samples in a neighborhood for a point to be considered as a core point.",
     )
     parser.add_argument(
@@ -80,14 +99,17 @@ def get_args():
         action="store_true",
         help="Builds HF datasets used for space visualization and pushes them to the hub",
     )
-    parser.add_argument("--username", type=str, default="loubnabnl")
+    parser.add_argument("--username", type=str, default="julien31")
     return parser.parse_args()
 
 
 def extract_res(example):
     summary = example["summary"]
     category = summary.split(". Educational")[0].strip()
-    score = summary.split(" Educational score: ")[1].strip()
+    try:
+        score = summary.split(" Educational score: ")[1].strip()
+    except:
+        score = None
     return {"category": category, "educational_score": score}
 
 
@@ -122,6 +144,11 @@ def build_hf_data_clusters(cc, texts=None, labels=None):
             "summary": cc.cluster_summaries[cluster_id],
             "examples": examples,
         }
+        try:
+            summary = cc.cluster_summaries[cluster_id]
+        except:
+            summary = None
+            cluster_info["summary"] = summary
 
         if not texts:
             cluster_info["position"] = cc.cluster_centers[cluster_id]
@@ -165,9 +192,9 @@ def main():
     args = get_args()
 
     template = (
-        TEMPLATE_MULTIPLE_TOPICS
+        TEMPLATE_MULTIPLE_TOPIC_chatml
         if args.topic_mode == "multiple_topics"
-        else TEMPLATE_SINGLE_TOPIC
+        else TEMPLATE_SINGLE_TOPIC_chatml
     )
     instruction = (
         INSTRUCTION_MULTIPLE_TOPICS
@@ -183,15 +210,28 @@ def main():
         dbscan_eps=args.dbscan_eps,
         dbscan_min_samples=args.dbscan_min_samples,
     )
-
     if args.mode == "run":
         # Run a new pipeline on texts
-        dataset_args = (args.input_dataset, args.data_subset) if args.data_subset else (args.input_dataset,)
-        ds = load_dataset(*dataset_args, split="train", token=True).shuffle(
+        # dataset_args = (args.input_dataset, args.data_subset) if args.data_subset else (args.input_dataset,)
+        # ds = load_dataset(*dataset_args, split="train", token=True).shuffle(
+        #     seed=42
+        # )
+
+        with open(args.input_dataset, encoding="utf-8") as f:
+            dataset = json.load(f)
+        to_remove=["emb","target_skills","puzzle_history","quality","description","is_valid","is_valid_explanation"]
+        for i in dataset:
+            for j in to_remove:
+                if j in i:
+                    del i[j]
+        from datasets import Dataset
+
+        ds = Dataset.from_list(dataset).shuffle(
             seed=42
         )
-
         print(ds)
+        args.end = min(args.end, len(ds))
+        args.n_samples = min(args.n_samples, len(ds))
         indexes = (
             range(args.start, args.end) if args.start > 0 else range(args.n_samples)
         )

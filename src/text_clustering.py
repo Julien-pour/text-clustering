@@ -15,6 +15,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm
 from umap import UMAP
+from tqdm import tqdm,trange
 
 logging.basicConfig(level=logging.INFO)
 
@@ -33,23 +34,29 @@ class ClusterClassifier:
         self,
         embed_model_name="all-MiniLM-L6-v2",
         embed_device="cpu",
-        embed_batch_size=64,
+        embed_batch_size=4,
         embed_max_seq_length=512,
         embed_agg_strategy=None,
         umap_components=2,
         umap_metric="cosine",
         dbscan_eps=0.08,
-        dbscan_min_samples=50,
+        dbscan_min_samples=4,
         dbscan_n_jobs=16,
         summary_create=True,
-        summary_model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+        inference_mode="vllm", # hf_client, vllm, ...
+        summary_model="heyholetsgo/Nous-Hermes-2-Mistral-7B-DPO-AWQ",#"mistralai/Mixtral-8x7B-Instruct-v0.1",
         topic_mode="multiple_topics",
-        summary_n_examples=10,
-        summary_chunk_size=420,
+        bs_summarize = 1,
+        temperature = 0.1,
+        top_p = 0.95,
+        summary_n_examples=4,
+        summary_chunk_size=900,
         summary_model_token=True,
         summary_template=None,
         summary_instruction=None,
+        fast_init=False,
     ):
+        
         self.embed_model_name = embed_model_name
         self.embed_device = embed_device
         self.embed_batch_size = embed_batch_size
@@ -63,13 +70,14 @@ class ClusterClassifier:
         self.dbscan_min_samples = dbscan_min_samples
         self.dbscan_n_jobs = dbscan_n_jobs
 
+        self.inference_mode = inference_mode
         self.summary_create = summary_create
         self.summary_model = summary_model
         self.topic_mode = topic_mode
         self.summary_n_examples = summary_n_examples
         self.summary_chunk_size = summary_chunk_size
         self.summary_model_token = summary_model_token
-
+        self.bs_summarize = bs_summarize
         if summary_template is None:
             self.summary_template = DEFAULT_TEMPLATE
         else:
@@ -88,12 +96,42 @@ class ClusterClassifier:
         self.umap_mapper = None
         self.id2label = None
         self.label2docs = None
+        if not fast_init:
+            self.embed_model = SentenceTransformer(
+                self.embed_model_name, device=self.embed_device
+            )
+            self.embed_model.max_seq_length = self.embed_max_seq_length
+        self.config_vllm = {"temperature":temperature, "top_p":top_p}
+        if self.summary_create and not fast_init:
+            self.init_model()
+            
+    def init_model(self):
+        if self.inference_mode == "hf_client":
+            client = InferenceClient(self.summary_model, token=self.summary_model_token)
+            client.text_generation("This is a test.")
+        elif self.inference_mode == "vllm":
+            from vllm import LLM, SamplingParams
+            self.sampling_params = SamplingParams(**self.config_vllm)
+        
+            quantization=None
+            if "awq" in self.summary_model.lower():
+                quantization="AWQ"
+            self.inference_model = LLM(model=self.summary_model, quantization=quantization,max_model_len = 3000, dtype="auto")
 
-        self.embed_model = SentenceTransformer(
-            self.embed_model_name, device=self.embed_device
-        )
-        self.embed_model.max_seq_length = self.embed_max_seq_length
-
+        else:
+            raise ValueError(
+                f"Inference mode {self.inference_mode} is not supported, use hf_client or vllm instead."
+            )
+    def get_completion_vllm(self, prompts):
+        outputs = self.inference_model.generate(prompts, self.sampling_params)
+        # Print the outputs.
+        list_out=[]
+        for output in outputs:
+            prompt = output.prompt
+            generated_text = output.outputs[0].text
+            list_out.append(generated_text)
+        return list_out
+    
     def fit(self, texts, embeddings=None):
         self.texts = texts
 
@@ -176,13 +214,15 @@ class ClusterClassifier:
         index = faiss.IndexFlatL2(embeddings.shape[1])
         index.add(embeddings)
         return index
-
+    
     def summarize(self, texts, labels):
         unique_labels = len(set(labels)) - 1  # exclude the "-1" label
-        client = InferenceClient(self.summary_model, token=self.summary_model_token)
+        if self.inference_mode == "hf_client":
+            client = InferenceClient(self.summary_model, token=self.summary_model_token)
         cluster_summaries = {-1: "None"}
-
-        for label in range(unique_labels):
+        list_request = []
+        print(f"Number of clusters is {unique_labels}")
+        for label in trange(unique_labels):
             ids = np.random.choice(self.label2docs[label], self.summary_n_examples)
             examples = "\n\n".join(
                 [
@@ -194,7 +234,20 @@ class ClusterClassifier:
             request = self.summary_template.format(
                 examples=examples, instruction=self.summary_instruction
             )
-            response = client.text_generation(request)
+            list_request.append(request)
+        list_response = []
+        if self.inference_mode == "hf_client":
+            for request in zip(list_request, range(unique_labels)):
+                
+                    response = client.text_generation(request)
+                    list_response.append(response)
+        elif self.inference_mode == "vllm":
+            list_response = self.get_completion_vllm(list_request)
+        else:
+            raise ValueError(
+                f"Inference mode {self.inference_mode} is not supported, use hf_client or vllm instead."
+            )
+        for label, response in zip(range(unique_labels), list_response):
             if label == 0:
                 print(f"Request:\n{request}")
             cluster_summaries[label] = self._postprocess_response(response)
@@ -203,22 +256,36 @@ class ClusterClassifier:
 
     def _postprocess_response(self, response):
         if self.topic_mode == "multiple_topics":
-            summary = response.split("\n")[0].split(".")[0].split("(")[0]
-            summary = ",".join(
-                [txt for txt in summary.strip().split(",") if len(txt) > 0]
-            )
+            try:
+                summary_1 = response.lower().split("topic:")[1].split(".")[0]#.split("(")[0]
+                summary = ",".join(
+                    [txt for txt in summary_1.strip().split(",") if len(txt) > 0]
+                )
+            except:
+                summary = "None"
+                print(summary_1)
             return summary
+        
         elif self.topic_mode == "single_topic":
-            first_line = response.split("\n")[0]
+            # first_line = response.split("\n")[0]
             topic, score = None, None
-            try:
-                topic = first_line.split("Topic:")[1].split("(")[0].split(",")[0].strip()
-            except IndexError:
-                print("No topic found")
-            try:
-                score = first_line.split("Educational value rating:")[1].strip().split(".")[0].strip()
-            except IndexError:
-                print("No educational score found")
+            for line in response.split("\n"):
+                if topic == None:
+                    try:
+                        topic = line.lower().split("Topic:".lower())[1].split("(")[0].split(",")[0].strip()
+                    except IndexError:
+                        # print("No topic found")
+                        pass
+                if score == None:
+                    try:
+                        score = line.lower().split("Educational value rating:".lower())[1].strip().split(".")[0].strip()
+                    except IndexError:
+                        # print("No educational score found")
+                        pass
+            if topic == None or score == None:
+                raise ValueError(
+                    f"Topic or score not found in the response: {response}"
+                )
             full_output = f"{topic}. Educational score: {score}"
             return full_output
         else:
@@ -316,7 +383,7 @@ class ClusterClassifier:
             kind="scatter",
             x="X",
             y="Y",
-            c="labels",
+            # c="labels",
             s=0.75,
             alpha=0.8,
             linewidth=0,
